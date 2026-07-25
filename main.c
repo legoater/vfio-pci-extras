@@ -17,6 +17,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/pci.h>
+#include <linux/debugfs.h>
 #include <linux/uaccess.h>
 #include <linux/vfio.h>
 #include <linux/vfio_pci_core.h>
@@ -84,6 +85,15 @@ static inline int vfio_check_precopy_ioctl(struct vfio_device *device,
 #define IGB_MIG_DIRTY_BUF_ADDR_HI	0x03C
 #define IGB_MIG_DIRTY_STATUS		0x040
 
+/* Migration statistics registers (read-only) */
+#define IGB_MIG_STAT_DMA_WRITES		0x100
+#define IGB_MIG_STAT_DMA_BYTES_LO	0x104
+#define IGB_MIG_STAT_DMA_BYTES_HI	0x108
+#define IGB_MIG_STAT_DIRTY_PAGES_SET	0x10C
+#define IGB_MIG_STAT_DIRTY_PAGES_CLR	0x110
+#define IGB_MIG_STAT_DIRTY_PAGE_COUNT	0x114
+#define IGB_MIG_STAT_DIRTY_QUERY_CNT	0x118
+
 /* Device state values */
 #define IGB_MIG_STATE_ERROR		0
 #define IGB_MIG_STATE_STOP		1
@@ -131,7 +141,7 @@ struct igb_mig_dirty_query {
 	__le32 bitmap_size;
 	__le32 dirty_page_count;
 	__le32 reserved1;
-	__le64 dma_count;
+	__le64 dma_writes;
 	__le32 reserved2[10];
 
 	/* Cache line 2+: bitmap (written by device) */
@@ -173,6 +183,9 @@ struct igb_pci_core_device {
 	u8 max_dirty_ranges;
 	u8 num_dirty_ranges;
 	u64 dirty_page_size;
+#ifdef CONFIG_VFIO_DEBUGFS
+	struct dentry *debug_root;
+#endif
 };
 
 #define MAX_MIGRATION_SIZE (256 * 1024)
@@ -886,6 +899,14 @@ static int igb_pci_get_data_size(struct vfio_device *vdev,
 	return 0;
 }
 
+#ifdef CONFIG_VFIO_DEBUGFS
+static void igb_debugfs_init(struct igb_pci_core_device *igb_dev);
+static void igb_debugfs_exit(struct igb_pci_core_device *igb_dev);
+#else
+static inline void igb_debugfs_init(struct igb_pci_core_device *igb_dev) {}
+static inline void igb_debugfs_exit(struct igb_pci_core_device *igb_dev) {}
+#endif
+
 static int igb_pci_open_device(struct vfio_device *core_vdev)
 {
 	struct igb_pci_core_device *igb_dev =
@@ -1161,10 +1182,10 @@ static int igb_pci_dirty_sync(struct igb_pci_core_device *igb_dev,
 	}
 
 	dev_dbg(&pdev->dev,
-		"dirty sync iova=%lx size=%lu dirty_pages=%u/%u dma_count=%llu\n",
+		"dirty sync iova=%lx size=%lu dirty_pages=%u/%u dma_writes=%llu\n",
 		iova, length, dirty_pages,
 		le32_to_cpu(query->dirty_page_count),
-		le64_to_cpu(query->dma_count));
+		le64_to_cpu(query->dma_writes));
 
 	return 0;
 }
@@ -1273,6 +1294,63 @@ static const struct vfio_log_ops igb_pci_log_ops = {
 	.log_read_and_clear = igb_pci_dma_log_read_and_clear,
 };
 
+#ifdef CONFIG_VFIO_DEBUGFS
+
+static int igb_stats_show(struct seq_file *s, void *unused)
+{
+	struct igb_pci_core_device *igb_dev = s->private;
+	u32 lo, hi;
+
+	mutex_lock(&igb_dev->state_mutex);
+	if (!igb_dev->mig_bar) {
+		seq_puts(s, "migration BAR not mapped\n");
+		goto out;
+	}
+
+	lo = mig_bar_read(igb_dev, IGB_MIG_STAT_DMA_BYTES_LO);
+	hi = mig_bar_read(igb_dev, IGB_MIG_STAT_DMA_BYTES_HI);
+
+	seq_printf(s, "dma_writes:       %u\n",
+		   mig_bar_read(igb_dev, IGB_MIG_STAT_DMA_WRITES));
+	seq_printf(s, "dma_bytes:        %llu\n",
+		   ((u64)hi << 32) | lo);
+	seq_printf(s, "dirty_pages_set:  %u\n",
+		   mig_bar_read(igb_dev, IGB_MIG_STAT_DIRTY_PAGES_SET));
+	seq_printf(s, "dirty_pages_clr:  %u\n",
+		   mig_bar_read(igb_dev, IGB_MIG_STAT_DIRTY_PAGES_CLR));
+	seq_printf(s, "dirty_page_count: %u\n",
+		   mig_bar_read(igb_dev, IGB_MIG_STAT_DIRTY_PAGE_COUNT));
+	seq_printf(s, "dirty_query_cnt:  %u\n",
+		   mig_bar_read(igb_dev, IGB_MIG_STAT_DIRTY_QUERY_CNT));
+out:
+	mutex_unlock(&igb_dev->state_mutex);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(igb_stats);
+
+static void igb_debugfs_init(struct igb_pci_core_device *igb_dev)
+{
+	struct dentry *migration_dir;
+
+	migration_dir = debugfs_lookup("migration",
+				       igb_dev->core_device.vdev.debug_root);
+	if (!migration_dir)
+		return;
+
+	igb_dev->debug_root = debugfs_create_dir("dirty", migration_dir);
+	dput(migration_dir);
+
+	debugfs_create_file("stats", 0444, igb_dev->debug_root,
+			    igb_dev, &igb_stats_fops);
+}
+
+static void igb_debugfs_exit(struct igb_pci_core_device *igb_dev)
+{
+	debugfs_remove_recursive(igb_dev->debug_root);
+	igb_dev->debug_root = NULL;
+}
+#endif
+
 static int igb_vfio_pci_init_dev(struct vfio_device *core_vdev)
 {
 	struct igb_pci_core_device *igb_dev =
@@ -1340,6 +1418,8 @@ static int igb_vfio_pci_probe(struct pci_dev *pdev,
 	ret = vfio_pci_core_register_device(&igb_dev->core_device);
 	if (ret)
 		goto out_put_vdev;
+
+	igb_debugfs_init(igb_dev);
 	return 0;
 
 out_put_vdev:
@@ -1351,6 +1431,7 @@ static void igb_vfio_pci_remove(struct pci_dev *pdev)
 {
 	struct igb_pci_core_device *igb_dev = igb_drvdata(pdev);
 
+	igb_debugfs_exit(igb_dev);
 	vfio_pci_core_unregister_device(&igb_dev->core_device);
 	vfio_put_device(&igb_dev->core_device.vdev);
 }

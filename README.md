@@ -157,13 +157,35 @@ Offset  Field              Written by  Description
 0x44    bitmap_size        device      Bytes written to bitmap
 0x48    dirty_page_count   device      Number of set bits in bitmap
 0x4C    reserved           -           Padding
-0x50    dma_count          device      Total DMA writes since enable
+0x50    dma_writes         device      Total DMA writes since enable
 0x58    reserved[10]       -           Pad to 64-byte cache line
 0x80    bitmap[]           device      Dirty page bitmap
 ```
 
 **Disable**: the driver writes `DIRTY_CTRL=DISABLE`, clears
 `DIRTY_BUF_ADDR`, and frees the shared buffer.
+
+### Migration statistics (0x100 – 0x118)
+
+Read-only registers providing per-migration-cycle counters. Reset on
+first `DIRTY_CTRL=ENABLE` or device reset, so the driver can read
+final values after `DIRTY_CTRL=DISABLE`.
+
+| Offset | Name                | Description                          |
+|--------|---------------------|--------------------------------------|
+| 0x100  | STAT_DMA_WRITES     | DMA write operations tracked         |
+| 0x104  | STAT_DMA_BYTES_LO   | DMA bytes written (low 32 bits)      |
+| 0x108  | STAT_DMA_BYTES_HI   | DMA bytes written (high 32 bits)     |
+| 0x10C  | STAT_DIRTY_PAGES_SET| Dirty pages marked since enable      |
+| 0x110  | STAT_DIRTY_PAGES_CLR| Dirty pages cleared by queries       |
+| 0x114  | STAT_DIRTY_PAGE_COUNT| Current dirty pages (set - cleared) |
+| 0x118  | STAT_DIRTY_QUERY_CNT| Number of QUERY operations           |
+
+The `dma_writes` counter is also reported in the dirty query buffer
+so the driver gets it alongside the bitmap without an extra MMIO read.
+
+These registers are exposed via debugfs at
+`/sys/kernel/debug/vfio/<device>/migration/dirty/stats`.
 
 ### Device states
 
