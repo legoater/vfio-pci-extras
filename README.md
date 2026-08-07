@@ -178,6 +178,13 @@ Offset  Field              Description
 These stats are exposed via debugfs at
 `/sys/kernel/debug/vfio/<device>/migration/dirty/stats`.
 
+## QEMU (L0)
+
+The emulated IGB PF with VF migration support is available on the
+`igb-migration` branch at https://github.com/legoater/qemu. See the
+[QEMU documentation](https://github.com/legoater/qemu/blob/igb-migration/docs/system/devices/igb-migration.rst)
+for setup and usage instructions.
+
 ## Build
 
 ```sh
